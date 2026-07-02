@@ -127,6 +127,35 @@ Zobacz `backend/.env.example`. Najważniejsze:
 
 ---
 
+## Wdrożenie w internecie (jeden adres URL)
+
+Aplikacja działa jako **jedna usługa** — backend FastAPI serwuje też zbudowany frontend,
+więc całość chodzi pod jednym adresem. Służy do tego `Dockerfile` (wieloetapowy build).
+
+### Opcja A — Render.com (bez CLI, z GitHuba) — zalecane
+
+1. Wejdź na <https://render.com> i zaloguj się (można przez GitHub).
+2. **New → Blueprint**, wskaż repo `pkkozinski-eng/jakis` i branch `claude/forex-signal-analyzer-04f9by`.
+   Render wykryje `render.yaml` i sam skonfiguruje usługę.
+3. (Opcjonalnie) w **Environment** wpisz `ANTHROPIC_API_KEY`, by włączyć realny odczyt
+   Claude Vision. Bez klucza usługa działa w trybie DEMO.
+4. **Apply** → po zbudowaniu dostaniesz publiczny URL, np. `https://forex-signal-analyzer.onrender.com`.
+
+> Uwaga: na darmowym planie usługa usypia po bezczynności (pierwsze wejście wolniejsze),
+> a lokalna historia (SQLite) może się resetować przy restarcie kontenera.
+
+### Opcja B — jeden kontener Docker (lokalnie lub dowolny host)
+
+```bash
+docker build -t forex-signal-analyzer .
+docker run -p 8000:8000 -e ANTHROPIC_API_KEY=twoj_klucz forex-signal-analyzer
+# otwórz http://localhost:8000
+```
+
+To samo `Dockerfile` zadziała też na Railway, Fly.io czy Hugging Face Spaces (Docker SDK).
+
+---
+
 ## Zakres MVP i dalsze kroki
 
 **W MVP:** upload 1 screenshotu + wybór pary/ramy, odczyt Claude Vision → JSON,

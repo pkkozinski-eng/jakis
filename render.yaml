@@ -1,0 +1,20 @@
+# Blueprint dla Render.com — wdrożenie jednym kliknięciem z repozytorium GitHub.
+# Instrukcja: https://render.com → New → Blueprint → wskaż to repo i branch.
+services:
+  - type: web
+    name: forex-signal-analyzer
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /api/health
+    envVars:
+      # Klucz Claude — wpisz w panelu Render (bez klucza aplikacja działa w trybie DEMO).
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      # Opcjonalny model z widzeniem
+      - key: ANTHROPIC_MODEL
+        value: claude-opus-4-8
+      # Opcjonalne dane makro na żywo (FRED) — bez klucza używana jest tabela wbudowana.
+      - key: FRED_API_KEY
+        sync: false

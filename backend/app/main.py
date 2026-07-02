@@ -1,10 +1,13 @@
 """FastAPI — punkt wejścia HTTP dla Forex Signal Analyzer."""
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from .analyzer import AnalysisError, analyze_image
 from .config import get_settings
@@ -105,3 +108,16 @@ def history_item(analysis_id: int) -> dict:
     if result is None:
         raise HTTPException(status_code=404, detail="Nie znaleziono analizy.")
     return result.model_dump()
+
+
+# --------------------------------------------------------------------------- #
+#  Serwowanie zbudowanego frontendu (tryb pojedynczej usługi / deployment).
+#  Gdy istnieje frontend/dist, backend serwuje SPA z tego samego adresu URL —
+#  jeden serwis do wdrożenia. Lokalnie w dev używa się osobno `npm run dev`.
+#  Mount MUSI być na końcu, po trasach /api, żeby ich nie przesłonić.
+# --------------------------------------------------------------------------- #
+_default_dist = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
+FRONTEND_DIST = Path(os.environ.get("FSA_FRONTEND_DIST", str(_default_dist)))
+
+if FRONTEND_DIST.is_dir():
+    app.mount("/", StaticFiles(directory=str(FRONTEND_DIST), html=True), name="frontend")
