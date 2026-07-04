@@ -1,0 +1,23 @@
+# Blueprint wdrozenia na Render.com (https://render.com).
+# Render oferuje darmowy web service + trwaly dysk, idealny dla Node+SQLite.
+# Po polaczeniu repozytorium Render sam wykryje ten plik.
+services:
+  - type: web
+    name: typer-premier-league
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: ADMIN_NICK
+        value: admin
+      - key: ADMIN_PIN
+        sync: false          # ustaw wlasny PIN w panelu Render (Secret)
+      - key: DATABASE_FILE
+        value: /data/typer.db # sciezka na trwalym dysku
+      - key: SESSION_SECRET
+        generateValue: true
+    disk:
+      name: typer-data
+      mountPath: /data        # trwaly dysk - baza przetrwa restarty i deploye
+      sizeGB: 1

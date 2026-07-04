@@ -1,0 +1,28 @@
+{
+  "name": "typer-premier-league",
+  "version": "1.0.0",
+  "description": "Aplikacja typerska Premier League 2026/27 - typowanie wynikow, punktacja, klasyfikacje",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "seed": "node src/seed.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "better-sqlite3": "^11.3.0",
+    "express": "^4.21.0"
+  },
+  "keywords": [
+    "premier-league",
+    "typer",
+    "predictions",
+    "football"
+  ],
+  "license": "MIT"
+}
