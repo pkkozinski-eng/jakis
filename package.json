@@ -1,0 +1,40 @@
+{
+  "name": "ctrader-mcp",
+  "version": "1.0.0",
+  "description": "MCP server that connects Claude to cTrader (Open API) for live chart analysis",
+  "type": "module",
+  "main": "dist/src/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "serve": "node dist/src/index.js",
+    "oauth": "tsx scripts/oauth.ts",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "http://local_proxy@127.0.0.1:41729/git/pkkozinski-eng/jakis"
+  },
+  "keywords": [
+    "mcp",
+    "ctrader",
+    "trading",
+    "claude"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@reiryoku/ctrader-layer": "^2.2.0",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.1.1",
+    "tsx": "^4.23.1",
+    "typescript": "^7.0.2"
+  }
+}
