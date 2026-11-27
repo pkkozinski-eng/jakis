@@ -9,8 +9,9 @@ namespace cAlgo.Robots
     // ============================================================================
     //  PriceActionBot – cBot dla cTrader (cAlgo)
     //  Strategia: wybicie zakresu azjatyckiego na otwarciu Londynu (M5).
-    //   - zakres azjatycki = max/min świec od 00:00 do 08:00 CE(S)T,
-    //   - okno wejść 08:00–11:00 CE(S)T,
+    //   - godziny strategii w CZASIE LONDYŃSKIM (GMT/BST),
+    //   - zakres azjatycki = max/min świec od 00:00 do 08:00 czasu Londynu,
+    //   - okno wejść 08:00–11:00 czasu Londynu (09:00–12:00 czasu polskiego),
     //   - sygnał: pierwsze zamknięcie świecy M5 poza zakresem (+ bufor),
     //     poprzednia świeca zamknięta jeszcze w zakresie,
     //   - opcjonalny filtr trendu H1 (EMA) – grać tylko z trendem (Fuller),
@@ -80,17 +81,18 @@ namespace cAlgo.Robots
         [Parameter("Allow XAUUSD", DefaultValue = false, Group = "FTMO")]
         public bool AllowGold { get; set; }
 
-        // Godziny w czasie CE(S)T (czas polski = czas FTMO).
-        [Parameter("Asian Range Start (h)", DefaultValue = 0, MinValue = 0, MaxValue = 23, Group = "Wybicie")]
+        // Godziny w CZASIE LONDYŃSKIM. Bot pracuje w CE(S)T (reset FTMO), a Londyn jest
+        // zawsze o 1 h wcześniej – Wielka Brytania i UE zmieniają czas w te same dni.
+        [Parameter("Asian Range Start (h, London)", DefaultValue = 0, MinValue = 0, MaxValue = 23, Group = "Wybicie")]
         public int AsianStartHour { get; set; }
 
-        [Parameter("Asian Range End (h)", DefaultValue = 8, MinValue = 1, MaxValue = 23, Group = "Wybicie")]
+        [Parameter("Asian Range End (h, London)", DefaultValue = 8, MinValue = 1, MaxValue = 23, Group = "Wybicie")]
         public int AsianEndHour { get; set; }
 
-        [Parameter("Trade Window Start (h)", DefaultValue = 8, MinValue = 0, MaxValue = 23, Group = "Wybicie")]
+        [Parameter("Trade Window Start (h, London)", DefaultValue = 8, MinValue = 0, MaxValue = 23, Group = "Wybicie")]
         public int TradeStartHour { get; set; }
 
-        [Parameter("Trade Window End (h)", DefaultValue = 11, MinValue = 1, MaxValue = 24, Group = "Wybicie")]
+        [Parameter("Trade Window End (h, London)", DefaultValue = 11, MinValue = 1, MaxValue = 24, Group = "Wybicie")]
         public int TradeEndHour { get; set; }
 
         // Ile pipsów za krawędzią zakresu musi zamknąć się świeca, żeby uznać wybicie.
@@ -126,6 +128,7 @@ namespace cAlgo.Robots
 
         private const string BotLabel = "PriceActionBot";   // etykieta identyfikująca zlecenia bota
         private const double GoldMaxRiskPercent = 0.25;      // max ryzyko na XAUUSD
+        private const int LondonToServerHours = 1;           // CE(S)T = czas Londynu + 1 h (cały rok)
 
         private Bars _h1Bars;                                // świece interwału H1 (filtr trendu)
         private ExponentialMovingAverage _emaH1;            // EMA na H1
@@ -211,8 +214,8 @@ namespace cAlgo.Robots
             if (CountTradesToday() >= MaxTradesPerDay)
                 return;
 
-            // 3) Okno wejść (np. 08:00–11:00 CE(S)T).
-            int hour = Server.Time.Hour;
+            // 3) Okno wejść w czasie Londynu (domyślnie 08:00–11:00).
+            int hour = LondonTime().Hour;
             if (hour < TradeStartHour || hour >= TradeEndHour)
                 return;
 
@@ -276,12 +279,14 @@ namespace cAlgo.Robots
         // ----------------------------------------------------------------------
         private void UpdateAsianRange()
         {
-            DateTime today = Server.Time.Date;
+            DateTime today = LondonTime().Date;   // dzień według czasu Londynu
             if (_rangeDay == today)
                 return;
 
-            DateTime from = today.AddHours(AsianStartHour);
-            DateTime to = today.AddHours(AsianEndHour);
+            // Granice zakresu w czasie Londynu, przeliczone na czas serwera bota (CE(S)T),
+            // bo w nim są OpenTime świec.
+            DateTime from = today.AddHours(AsianStartHour + LondonToServerHours);
+            DateTime to = today.AddHours(AsianEndHour + LondonToServerHours);
             if (Server.Time < to)
                 return; // zakres jeszcze się nie zamknął
 
@@ -305,7 +310,7 @@ namespace cAlgo.Robots
 
             if (count == 0)
             {
-                Print("Brak świec w zakresie azjatyckim {0:HH:mm}–{1:HH:mm} – dziś bez handlu.", from, to);
+                Print("Brak świec w zakresie azjatyckim {0:00}:00–{1:00}:00 (Londyn) – dziś bez handlu.", AsianStartHour, AsianEndHour);
                 return;
             }
 
@@ -321,6 +326,12 @@ namespace cAlgo.Robots
             _asianLow = low;
             _rangeValid = true;
             Print("Zakres azjatycki {0:yyyy-MM-dd}: {1:F5}–{2:F5} ({3:F1} pips).", today, low, high, rangePips);
+        }
+
+        // Bieżący czas Londynu (GMT zimą, BST latem).
+        private DateTime LondonTime()
+        {
+            return Server.Time.AddHours(-LondonToServerHours);
         }
 
         // Czy bot otworzył już dziś transakcję w tym kierunku na tej parze.
