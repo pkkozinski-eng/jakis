@@ -8,9 +8,15 @@ namespace cAlgo.Robots
 {
     // ============================================================================
     //  PriceActionBot – cBot dla cTrader (cAlgo)
-    //  Strategia price action w stylu Nial Fuller na interwale M5.
-    //  Sygnały: pin bar + inside bar, filtrowane trendem H1 (EMA)
-    //  oraz kontekstem poziomów support/resistance.
+    //  Strategia: wybicie zakresu azjatyckiego na otwarciu Londynu (M5).
+    //   - zakres azjatycki = max/min świec od 00:00 do 08:00 CE(S)T,
+    //   - okno wejść 08:00–11:00 CE(S)T,
+    //   - sygnał: pierwsze zamknięcie świecy M5 poza zakresem (+ bufor),
+    //     poprzednia świeca zamknięta jeszcze w zakresie,
+    //   - opcjonalny filtr trendu H1 (EMA) – grać tylko z trendem (Fuller),
+    //   - filtr szerokości zakresu (za wąski / za szeroki = brak handlu),
+    //   - SL za przeciwną krawędzią zakresu (albo za jego środkiem), TP = R:R,
+    //   - max 1 wejście w każdym kierunku na parę dziennie.
     //
     //  OCHRONA FTMO (konto 10 000 USD):
     //   - dzienny limit straty (domyślnie 3% kapitału początkowego), liczony jak
@@ -74,17 +80,41 @@ namespace cAlgo.Robots
         [Parameter("Allow XAUUSD", DefaultValue = false, Group = "FTMO")]
         public bool AllowGold { get; set; }
 
+        // Godziny w czasie CE(S)T (czas polski = czas FTMO).
+        [Parameter("Asian Range Start (h)", DefaultValue = 0, MinValue = 0, MaxValue = 23, Group = "Wybicie")]
+        public int AsianStartHour { get; set; }
+
+        [Parameter("Asian Range End (h)", DefaultValue = 8, MinValue = 1, MaxValue = 23, Group = "Wybicie")]
+        public int AsianEndHour { get; set; }
+
+        [Parameter("Trade Window Start (h)", DefaultValue = 8, MinValue = 0, MaxValue = 23, Group = "Wybicie")]
+        public int TradeStartHour { get; set; }
+
+        [Parameter("Trade Window End (h)", DefaultValue = 11, MinValue = 1, MaxValue = 24, Group = "Wybicie")]
+        public int TradeEndHour { get; set; }
+
+        // Ile pipsów za krawędzią zakresu musi zamknąć się świeca, żeby uznać wybicie.
+        [Parameter("Breakout Buffer (pips)", DefaultValue = 1.0, MinValue = 0.0, MaxValue = 50.0, Step = 0.5, Group = "Wybicie")]
+        public double BreakoutBufferPips { get; set; }
+
+        // Za wąski zakres = szum, za szeroki = ruch już się odbył / za duży SL.
+        [Parameter("Min Range (pips)", DefaultValue = 10, MinValue = 0, MaxValue = 1000, Group = "Wybicie")]
+        public double MinRangePips { get; set; }
+
+        [Parameter("Max Range (pips)", DefaultValue = 50, MinValue = 1, MaxValue = 5000, Group = "Wybicie")]
+        public double MaxRangePips { get; set; }
+
+        // SL za środkiem zakresu zamiast za przeciwną krawędzią (mniejszy SL, częstsze wybicia SL).
+        [Parameter("SL at Range Middle", DefaultValue = false, Group = "Wybicie")]
+        public bool SlAtMidRange { get; set; }
+
+        // Filtr trendu H1: long tylko nad EMA, short tylko pod EMA.
+        [Parameter("Use H1 Trend Filter", DefaultValue = true, Group = "Wybicie")]
+        public bool UseTrendFilter { get; set; }
+
         // Okres EMA na wyższym interwale (H1) używanej jako filtr trendu.
-        [Parameter("EMA Period (H1)", DefaultValue = 50, MinValue = 5, MaxValue = 400, Group = "Sygnał")]
+        [Parameter("EMA Period (H1)", DefaultValue = 50, MinValue = 5, MaxValue = 400, Group = "Wybicie")]
         public int EmaPeriod { get; set; }
-
-        // Liczba świec wstecz do wyznaczenia kluczowych poziomów support/resistance.
-        [Parameter("Level Lookback (bars)", DefaultValue = 20, MinValue = 5, MaxValue = 300, Group = "Sygnał")]
-        public int LevelLookback { get; set; }
-
-        // Minimalny stosunek długości knota do korpusu, aby uznać świecę za pin bar.
-        [Parameter("Pin Bar Wick Ratio", DefaultValue = 2.0, MinValue = 1.0, MaxValue = 10.0, Step = 0.1, Group = "Sygnał")]
-        public double PinBarWickRatio { get; set; }
 
         // Docelowa wartość konta (equity). Po jej osiągnięciu bot przestaje otwierać nowe pozycje.
         [Parameter("Target Equity", DefaultValue = 1000000, MinValue = 1, Group = "Cel")]
@@ -105,6 +135,11 @@ namespace cAlgo.Robots
         private bool _tradingBlockedToday;                   // handel zablokowany do następnego dnia
         private bool _totalLimitHit;                         // osiągnięto limit całkowity – koniec handlu
 
+        private DateTime _rangeDay = DateTime.MinValue;      // dzień, dla którego policzono zakres
+        private bool _rangeValid;                            // zakres policzony i przeszedł filtry
+        private double _asianHigh;                           // maksimum zakresu azjatyckiego
+        private double _asianLow;                            // minimum zakresu azjatyckiego
+
         // ----------------------------------------------------------------------
         //  START
         // ----------------------------------------------------------------------
@@ -118,6 +153,9 @@ namespace cAlgo.Robots
                 Stop();
                 return;
             }
+
+            if (TimeFrame != TimeFrame.Minute5)
+                Print("UWAGA: bot projektowany na M5, uruchomiony na {0}.", TimeFrame);
 
             // Pobieramy świece H1 i budujemy na nich EMA – to nasz filtr trendu wyższego rzędu.
             _h1Bars = MarketData.GetBars(TimeFrame.Hour);
@@ -173,89 +211,128 @@ namespace cAlgo.Robots
             if (CountTradesToday() >= MaxTradesPerDay)
                 return;
 
-            // 3) Sprawdzamy, czy mamy wystarczająco danych historycznych.
-            if (Bars.Count < LevelLookback + 3 || _h1Bars.Count < EmaPeriod + 2)
+            // 3) Okno wejść (np. 08:00–11:00 CE(S)T).
+            int hour = Server.Time.Hour;
+            if (hour < TradeStartHour || hour >= TradeEndHour)
                 return;
 
-            // 4) Wyznaczamy kierunek trendu na H1 (filtr EMA).
-            //    Cena zamknięcia ostatniej zamkniętej świecy H1 vs EMA.
-            double h1Close = _h1Bars.ClosePrices.Last(1);
-            double h1Ema = _emaH1.Result.Last(1);
-            bool trendUp = h1Close > h1Ema;     // cena nad EMA(H1) => tylko longi
-            bool trendDown = h1Close < h1Ema;   // cena pod EMA(H1) => tylko shorty
+            // 4) Zakres azjatycki na dziś (liczony raz dziennie, po jego zamknięciu).
+            UpdateAsianRange();
+            if (!_rangeValid)
+                return;
 
-            // 5) Wyznaczamy kluczowe poziomy support/resistance z ostatnich N świec.
-            //    (pomijamy świecę sygnałową Last(1), liczymy od Last(2) w tył)
-            double support = double.MaxValue;
-            double resistance = double.MinValue;
-            for (int k = 2; k <= LevelLookback + 1; k++)
-            {
-                var b = Bars.Last(k);
-                if (b.Low < support) support = b.Low;
-                if (b.High > resistance) resistance = b.High;
-            }
-            // Strefa tolerancji przy poziomie = 15% szerokości zakresu N świec.
-            double zoneTolerance = (resistance - support) * 0.15;
+            if (Bars.Count < 3)
+                return;
 
-            // 6) Świeca sygnałowa (ostatnia zamknięta) i świeca-matka (poprzednia).
+            // 5) Świeca sygnałowa (ostatnia zamknięta) i poprzednia.
             var signal = Bars.Last(1);
-            var mother = Bars.Last(2);
+            var prev = Bars.Last(2);
+            double buffer = BreakoutBufferPips * Symbol.PipSize;
 
-            // 7) Detekcja formacji na świecy sygnałowej.
-            bool bullishPin = IsBullishPinBar(signal);
-            bool bearishPin = IsBearishPinBar(signal);
-            bool insideBar = IsInsideBar(signal, mother);
-
-            // 8) Kontekst: sygnał musi wystąpić przy odbiciu od poziomu.
-            //    Long – świeca dotyka strefy supportu; Short – dotyka strefy oporu.
-            bool atSupport = signal.Low <= support + zoneTolerance;
-            bool atResistance = signal.High >= resistance - zoneTolerance;
-
-            // ------------------------------------------------------------------
-            //  DECYZJE WEJŚCIA
-            // ------------------------------------------------------------------
-
-            // --- LONG: pin bar byczy, przy supporcie, zgodny z trendem H1 ---
-            if (trendUp && bullishPin && atSupport)
-            {
-                double slPrice = signal.Low - SlBufferPips * Symbol.PipSize;
-                Print("SYGNAŁ LONG (Pin Bar) @ support {0:F5}. SL@{1:F5}", support, slPrice);
-                OpenMarketTrade(TradeType.Buy, slPrice);
+            // Świeże wybicie: sygnałowa zamyka się poza zakresem, poprzednia jeszcze w nim.
+            bool breakUp = signal.Close > _asianHigh + buffer && prev.Close <= _asianHigh + buffer;
+            bool breakDown = signal.Close < _asianLow - buffer && prev.Close >= _asianLow - buffer;
+            if (!breakUp && !breakDown)
                 return;
-            }
 
-            // --- SHORT: pin bar niedźwiedzi, przy oporze, zgodny z trendem H1 ---
-            if (trendDown && bearishPin && atResistance)
+            // 6) Filtr trendu H1 (Fuller: grać z trendem wyższego interwału).
+            if (UseTrendFilter)
             {
-                double slPrice = signal.High + SlBufferPips * Symbol.PipSize;
-                Print("SYGNAŁ SHORT (Pin Bar) @ resistance {0:F5}. SL@{1:F5}", resistance, slPrice);
-                OpenMarketTrade(TradeType.Sell, slPrice);
-                return;
-            }
-
-            // --- INSIDE BAR: wejście na wybicie ekstremum świecy-matki ---
-            //     Zlecenie oczekujące Stop; kierunek zgodny z trendem H1 i poziomem.
-            if (insideBar)
-            {
-                if (trendUp && atSupport)
+                if (_h1Bars.Count < EmaPeriod + 2)
+                    return;
+                double h1Close = _h1Bars.ClosePrices.Last(1);
+                double h1Ema = _emaH1.Result.Last(1);
+                if (breakUp && h1Close <= h1Ema)
                 {
-                    // wejście powyżej maksimum matki, SL za minimum matki
-                    double entry = mother.High + SlBufferPips * Symbol.PipSize;
-                    double slPrice = mother.Low - SlBufferPips * Symbol.PipSize;
-                    Print("SYGNAŁ LONG (Inside Bar) – stop @ {0:F5}, SL@{1:F5}", entry, slPrice);
-                    PlaceStopTrade(TradeType.Buy, entry, slPrice);
+                    Print("Wybicie w górę odrzucone: H1 pod EMA({0}).", EmaPeriod);
                     return;
                 }
-                if (trendDown && atResistance)
+                if (breakDown && h1Close >= h1Ema)
                 {
-                    // wejście poniżej minimum matki, SL za maksimum matki
-                    double entry = mother.Low - SlBufferPips * Symbol.PipSize;
-                    double slPrice = mother.High + SlBufferPips * Symbol.PipSize;
-                    Print("SYGNAŁ SHORT (Inside Bar) – stop @ {0:F5}, SL@{1:F5}", entry, slPrice);
-                    PlaceStopTrade(TradeType.Sell, entry, slPrice);
+                    Print("Wybicie w dół odrzucone: H1 nad EMA({0}).", EmaPeriod);
                     return;
                 }
             }
+
+            // 7) Max 1 wejście w danym kierunku na tej parze dziennie.
+            var type = breakUp ? TradeType.Buy : TradeType.Sell;
+            if (DirectionTradedToday(type))
+                return;
+
+            // 8) SL za przeciwną krawędzią zakresu (lub za środkiem), TP = R:R.
+            double slBuffer = SlBufferPips * Symbol.PipSize;
+            double mid = (_asianHigh + _asianLow) / 2.0;
+            double slPrice = breakUp
+                ? (SlAtMidRange ? mid : _asianLow) - slBuffer
+                : (SlAtMidRange ? mid : _asianHigh) + slBuffer;
+
+            Print("SYGNAŁ {0}: wybicie zakresu azjatyckiego {1:F5}–{2:F5}, zamknięcie {3:F5}, SL@{4:F5}",
+                breakUp ? "LONG" : "SHORT", _asianLow, _asianHigh, signal.Close, slPrice);
+            OpenMarketTrade(type, slPrice);
+        }
+
+        // ----------------------------------------------------------------------
+        //  ZAKRES AZJATYCKI
+        // ----------------------------------------------------------------------
+        private void UpdateAsianRange()
+        {
+            DateTime today = Server.Time.Date;
+            if (_rangeDay == today)
+                return;
+
+            DateTime from = today.AddHours(AsianStartHour);
+            DateTime to = today.AddHours(AsianEndHour);
+            if (Server.Time < to)
+                return; // zakres jeszcze się nie zamknął
+
+            _rangeDay = today;
+            _rangeValid = false;
+
+            double high = double.MinValue;
+            double low = double.MaxValue;
+            int count = 0;
+            for (int i = Bars.Count - 1; i >= 0; i--)
+            {
+                var bar = Bars[i];
+                if (bar.OpenTime < from)
+                    break;
+                if (bar.OpenTime >= to)
+                    continue;
+                if (bar.High > high) high = bar.High;
+                if (bar.Low < low) low = bar.Low;
+                count++;
+            }
+
+            if (count == 0)
+            {
+                Print("Brak świec w zakresie azjatyckim {0:HH:mm}–{1:HH:mm} – dziś bez handlu.", from, to);
+                return;
+            }
+
+            double rangePips = (high - low) / Symbol.PipSize;
+            if (rangePips < MinRangePips || rangePips > MaxRangePips)
+            {
+                Print("Zakres azjatycki {0:F1} pips poza filtrem {1}–{2} – dziś bez handlu.",
+                    rangePips, MinRangePips, MaxRangePips);
+                return;
+            }
+
+            _asianHigh = high;
+            _asianLow = low;
+            _rangeValid = true;
+            Print("Zakres azjatycki {0:yyyy-MM-dd}: {1:F5}–{2:F5} ({3:F1} pips).", today, low, high, rangePips);
+        }
+
+        // Czy bot otworzył już dziś transakcję w tym kierunku na tej parze.
+        private bool DirectionTradedToday(TradeType type)
+        {
+            foreach (var t in History)
+                if (t.Label == BotLabel && t.SymbolName == SymbolName && t.TradeType == type && t.EntryTime >= _currentDay)
+                    return true;
+            foreach (var p in Positions)
+                if (p.Label == BotLabel && p.SymbolName == SymbolName && p.TradeType == type && p.EntryTime >= _currentDay)
+                    return true;
+            return false;
         }
 
         // ----------------------------------------------------------------------
@@ -387,53 +464,6 @@ namespace cAlgo.Robots
         }
 
         // ----------------------------------------------------------------------
-        //  DETEKCJA FORMACJI
-        // ----------------------------------------------------------------------
-
-        // Byczy pin bar: długi dolny knot, korpus w górnej 1/3 świecy.
-        private bool IsBullishPinBar(Bar bar)
-        {
-            double range = bar.High - bar.Low;
-            if (range <= 0) return false;
-
-            double body = Math.Abs(bar.Close - bar.Open);
-            double bodySafe = Math.Max(body, Symbol.PipSize * 0.1); // zabezpieczenie przed dzieleniem przez 0
-            double lowerWick = Math.Min(bar.Open, bar.Close) - bar.Low;
-            double upperWick = bar.High - Math.Max(bar.Open, bar.Close);
-
-            // Warunki: dolny knot >= ratio * korpus, korpus w górnej 1/3, mały górny knot.
-            bool longLowerWick = lowerWick >= PinBarWickRatio * bodySafe;
-            bool bodyInUpperThird = Math.Min(bar.Open, bar.Close) >= bar.Low + range * (2.0 / 3.0);
-            bool smallUpperWick = upperWick <= body; // górny knot nie dłuższy niż korpus
-
-            return longLowerWick && bodyInUpperThird && smallUpperWick;
-        }
-
-        // Niedźwiedzi pin bar: długi górny knot, korpus w dolnej 1/3 świecy.
-        private bool IsBearishPinBar(Bar bar)
-        {
-            double range = bar.High - bar.Low;
-            if (range <= 0) return false;
-
-            double body = Math.Abs(bar.Close - bar.Open);
-            double bodySafe = Math.Max(body, Symbol.PipSize * 0.1);
-            double lowerWick = Math.Min(bar.Open, bar.Close) - bar.Low;
-            double upperWick = bar.High - Math.Max(bar.Open, bar.Close);
-
-            bool longUpperWick = upperWick >= PinBarWickRatio * bodySafe;
-            bool bodyInLowerThird = Math.Max(bar.Open, bar.Close) <= bar.Low + range * (1.0 / 3.0);
-            bool smallLowerWick = lowerWick <= body;
-
-            return longUpperWick && bodyInLowerThird && smallLowerWick;
-        }
-
-        // Inside bar: świeca w pełni objęta zakresem świecy-matki.
-        private bool IsInsideBar(Bar bar, Bar mother)
-        {
-            return bar.High <= mother.High && bar.Low >= mother.Low;
-        }
-
-        // ----------------------------------------------------------------------
         //  WYKONANIE ZLECEŃ + OBLICZANIE WOLUMENU
         // ----------------------------------------------------------------------
 
@@ -463,32 +493,6 @@ namespace cAlgo.Robots
                     type, volume, slPips, tpPips, Account.Balance);
             else
                 Print("Błąd otwarcia pozycji: {0}", result.Error);
-        }
-
-        // Złożenie zlecenia oczekującego Stop (dla inside bara – wybicie ekstremum matki).
-        private void PlaceStopTrade(TradeType type, double entryPrice, double slPrice)
-        {
-            double slPips = Math.Abs(entryPrice - slPrice) / Symbol.PipSize;
-            if (slPips <= 0)
-            {
-                Print("Odrzucono zlecenie stop: zerowa odległość SL.");
-                return;
-            }
-
-            double tpPips = slPips * RiskReward;
-
-            double volume = CalculatePositionVolume(slPips);
-            if (volume <= 0)
-                return;
-
-            // Zlecenie ważne przez ograniczony czas – aby nie zostało w rynku po utracie kontekstu.
-            var expiry = Server.Time.AddHours(2);
-            var result = PlaceStopOrder(type, SymbolName, volume, entryPrice, BotLabel, slPips, tpPips, expiry);
-            if (result.IsSuccessful)
-                Print("ZŁOŻONO STOP {0} vol={1} entry={2:F5} SLpips={3:F1} TPpips={4:F1}",
-                    type, volume, entryPrice, slPips, tpPips);
-            else
-                Print("Błąd złożenia zlecenia stop: {0}", result.Error);
         }
 
         // Obliczenie wolumenu w jednostkach na podstawie stałego ryzyka i odległości SL.
