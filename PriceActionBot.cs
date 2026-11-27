@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using cAlgo.API;
 using cAlgo.API.Indicators;
 using cAlgo.API.Internals;
@@ -10,20 +11,34 @@ namespace cAlgo.Robots
     //  Strategia price action w stylu Nial Fuller na interwale M5.
     //  Sygnały: pin bar + inside bar, filtrowane trendem H1 (EMA)
     //  oraz kontekstem poziomów support/resistance.
-    //  Zarządzanie ryzykiem: stały % kapitału, dynamiczna wielkość pozycji,
-    //  auto-compounding (liczenie od aktualnego salda), limit dziennego DD.
+    //
+    //  OCHRONA FTMO (konto 10 000 USD):
+    //   - dzienny limit straty (domyślnie 3% kapitału początkowego), liczony jak
+    //     w FTMO: od salda z początku dnia (północ czasu CE(S)T), z otwartymi
+    //     pozycjami (equity); po jego osiągnięciu bot zamyka pozycje, usuwa
+    //     zlecenia oczekujące i blokuje handel do następnego dnia,
+    //   - całkowity limit straty (FTMO 10%) z buforem bezpieczeństwa; po jego
+    //     osiągnięciu bot zamyka wszystko i zatrzymuje się na stałe,
+    //   - stałe ryzyko na transakcję (domyślnie 0,5%, twardy limit 1%;
+    //     XAUUSD max 0,25%),
+    //   - kontrola przed wejściem: transakcja nie zostanie otwarta, jeśli jej
+    //     ryzyko (SL) mogłoby przebić limit dzienny lub całkowity,
+    //   - tylko EURUSD, GBPUSD (+ opcjonalnie XAUUSD),
+    //   - max 1 otwarta pozycja na całym koncie (wszystkie instancje bota)
+    //     i max 2 transakcje dziennie łącznie ze wszystkich par.
     // ============================================================================
 
+    // Strefa czasowa CE(S)T – FTMO resetuje dzienny limit o północy czasu praskiego.
     // AccessRights.None – bot nie potrzebuje dostępu do systemu plików ani sieci.
-    [Robot(TimeZone = TimeZones.UTC, AccessRights = AccessRights.None)]
+    [Robot(TimeZone = TimeZones.CentralEuropeanStandardTime, AccessRights = AccessRights.None)]
     public class PriceActionBot : Robot
     {
         // ----------------------------------------------------------------------
         //  PARAMETRY (widoczne i edytowalne w UI cTrader)
         // ----------------------------------------------------------------------
 
-        // Procent kapitału ryzykowany na pojedynczą transakcję (np. 1 = 1%).
-        [Parameter("Risk Percent (%)", DefaultValue = 1.0, MinValue = 0.1, MaxValue = 100.0, Step = 0.1, Group = "Ryzyko")]
+        // Procent kapitału ryzykowany na pojedynczą transakcję. Twardy limit 1%.
+        [Parameter("Risk Percent (%)", DefaultValue = 0.5, MinValue = 0.1, MaxValue = 1.0, Step = 0.05, Group = "Ryzyko")]
         public double RiskPercent { get; set; }
 
         // Stosunek zysku do ryzyka (TP = RiskReward * odległość do SL).
@@ -34,9 +49,30 @@ namespace cAlgo.Robots
         [Parameter("SL Buffer (pips)", DefaultValue = 2.0, MinValue = 0.0, MaxValue = 50.0, Step = 0.5, Group = "Ryzyko")]
         public double SlBufferPips { get; set; }
 
-        // Maksymalny dzienny drawdown (%) – po przekroczeniu bot nie otwiera pozycji do końca dnia.
-        [Parameter("Max Daily Drawdown (%)", DefaultValue = 5.0, MinValue = 0.5, MaxValue = 100.0, Step = 0.5, Group = "Ryzyko")]
-        public double MaxDailyDrawdownPercent { get; set; }
+        // Kapitał początkowy konta FTMO – baza dla limitów dziennego i całkowitego.
+        [Parameter("Initial Balance", DefaultValue = 10000, MinValue = 100, Group = "FTMO")]
+        public double InitialBalance { get; set; }
+
+        // Dzienny limit straty w % kapitału początkowego (FTMO: 5%, zasada projektu: 3%).
+        [Parameter("Daily Loss Limit (%)", DefaultValue = 3.0, MinValue = 0.5, MaxValue = 5.0, Step = 0.1, Group = "FTMO")]
+        public double DailyLossLimitPercent { get; set; }
+
+        // Całkowity limit straty w % kapitału początkowego (FTMO: 10%).
+        [Parameter("Max Total Loss (%)", DefaultValue = 10.0, MinValue = 1.0, MaxValue = 10.0, Step = 0.5, Group = "FTMO")]
+        public double MaxTotalLossPercent { get; set; }
+
+        // Bufor bezpieczeństwa dla limitu całkowitego: bot reaguje przy (limit - bufor),
+        // żeby poślizg przy zamykaniu nie przebił twardej granicy FTMO.
+        [Parameter("Total Loss Buffer (%)", DefaultValue = 1.0, MinValue = 0.0, MaxValue = 5.0, Step = 0.1, Group = "FTMO")]
+        public double TotalLossBufferPercent { get; set; }
+
+        // Maksymalna liczba transakcji dziennie (łącznie wszystkie pary).
+        [Parameter("Max Trades Per Day", DefaultValue = 2, MinValue = 1, MaxValue = 10, Group = "FTMO")]
+        public int MaxTradesPerDay { get; set; }
+
+        // Złoto dopuszczone dopiero po osobnym backteście.
+        [Parameter("Allow XAUUSD", DefaultValue = false, Group = "FTMO")]
+        public bool AllowGold { get; set; }
 
         // Okres EMA na wyższym interwale (H1) używanej jako filtr trendu.
         [Parameter("EMA Period (H1)", DefaultValue = 50, MinValue = 5, MaxValue = 400, Group = "Sygnał")]
@@ -59,42 +95,65 @@ namespace cAlgo.Robots
         // ----------------------------------------------------------------------
 
         private const string BotLabel = "PriceActionBot";   // etykieta identyfikująca zlecenia bota
+        private const double GoldMaxRiskPercent = 0.25;      // max ryzyko na XAUUSD
 
         private Bars _h1Bars;                                // świece interwału H1 (filtr trendu)
         private ExponentialMovingAverage _emaH1;            // EMA na H1
 
-        private DateTime _currentDay;                        // aktualny dzień handlowy (do resetu limitu DD)
-        private double _dayStartEquity;                      // equity na początku dnia (baza dla limitu DD)
-        private bool _tradingBlockedToday;                   // czy handel zablokowany do końca dnia
+        private DateTime _currentDay;                        // aktualny dzień handlowy (CE(S)T)
+        private double _dayStartBalance;                     // saldo na początku dnia (baza limitu dziennego)
+        private bool _tradingBlockedToday;                   // handel zablokowany do następnego dnia
+        private bool _totalLimitHit;                         // osiągnięto limit całkowity – koniec handlu
 
         // ----------------------------------------------------------------------
         //  START
         // ----------------------------------------------------------------------
         protected override void OnStart()
         {
+            // Dozwolone instrumenty – na innych symbolach bot się nie uruchamia.
+            if (!IsAllowedSymbol())
+            {
+                Print("STOP: symbol {0} nie jest dozwolony (tylko EURUSD, GBPUSD{1}).",
+                    SymbolName, AllowGold ? ", XAUUSD" : "; XAUUSD wyłączony parametrem");
+                Stop();
+                return;
+            }
+
             // Pobieramy świece H1 i budujemy na nich EMA – to nasz filtr trendu wyższego rzędu.
             _h1Bars = MarketData.GetBars(TimeFrame.Hour);
             _emaH1 = Indicators.ExponentialMovingAverage(_h1Bars.ClosePrices, EmaPeriod);
 
-            // Inicjalizacja licznika dnia i bazy do liczenia dziennego drawdownu.
-            _currentDay = Server.Time.Date;
-            _dayStartEquity = Account.Equity;
-            _tradingBlockedToday = false;
+            // Baza dnia odtwarzana z historii – restart bota w trakcie dnia
+            // nie „zeruje” już poniesionych strat.
+            StartNewDay(Server.Time.Date);
 
-            Print("PriceActionBot uruchomiony. Symbol: {0}, TF: {1}, Balance: {2:F2} {3}",
-                SymbolName, TimeFrame, Account.Balance, Account.Asset.Name);
+            Print("PriceActionBot uruchomiony. Symbol: {0}, TF: {1}, Balance: {2:F2} {3}, ryzyko/transakcję: {4:F2}%",
+                SymbolName, TimeFrame, Account.Balance, Account.Asset.Name, EffectiveRiskPercent());
+            Print("FTMO: limit dzienny {0:F2}% ({1:F2}), limit całkowity {2:F2}% (bot reaguje przy {3:F2}%), max {4} transakcji/dzień.",
+                DailyLossLimitPercent, DailyLossLimitAmount(), MaxTotalLossPercent,
+                MaxTotalLossPercent - TotalLossBufferPercent, MaxTradesPerDay);
+
+            CheckRiskLimits();
+        }
+
+        // ----------------------------------------------------------------------
+        //  OCHRONA NA KAŻDYM TICKU – tylko kontrola limitów (zamykanie pozycji),
+        //  nowe wejścia nadal wyłącznie w OnBar.
+        // ----------------------------------------------------------------------
+        protected override void OnTick()
+        {
+            CheckRiskLimits();
         }
 
         // ----------------------------------------------------------------------
         //  GŁÓWNA LOGIKA – wywoływana na zamknięcie każdej świecy M5
-        //  (OnBar, nie OnTick – zgodnie z wymaganiami)
         // ----------------------------------------------------------------------
         protected override void OnBar()
         {
-            // 1) Obsługa zmiany dnia i limitu dziennego drawdownu.
-            HandleNewDayAndDrawdown();
-            if (_tradingBlockedToday)
-                return; // przekroczono dzienny limit strat – nie otwieramy nic do jutra
+            // 1) Limity FTMO (zmiana dnia, limit dzienny, limit całkowity).
+            CheckRiskLimits();
+            if (_tradingBlockedToday || _totalLimitHit)
+                return;
 
             // 2) Warunki blokujące otwieranie nowych pozycji.
             if (Account.Equity >= TargetEquity)
@@ -104,8 +163,14 @@ namespace cAlgo.Robots
                 return;
             }
 
-            // Reguła: tylko jedna otwarta pozycja na raz + żadnych wiszących zleceń bota.
+            // Max 1 otwarta pozycja / zlecenie na CAŁYM koncie (wszystkie pary).
+            // To też realizuje zasadę korelacji: przy sygnale na GBPUSD i EURUSD
+            // w tym samym kierunku wejdzie tylko pierwszy.
             if (CountBotPositions() > 0 || CountBotPendingOrders() > 0)
+                return;
+
+            // Max N transakcji dziennie łącznie.
+            if (CountTradesToday() >= MaxTradesPerDay)
                 return;
 
             // 3) Sprawdzamy, czy mamy wystarczająco danych historycznych.
@@ -194,30 +259,131 @@ namespace cAlgo.Robots
         }
 
         // ----------------------------------------------------------------------
-        //  ZARZĄDZANIE DNIEM I LIMITEM DZIENNEGO DRAWDOWNU
+        //  OCHRONA FTMO – LIMIT DZIENNY I CAŁKOWITY
         // ----------------------------------------------------------------------
-        private void HandleNewDayAndDrawdown()
+
+        // Kwota dziennego limitu straty (np. 3% z 10 000 = 300 USD).
+        private double DailyLossLimitAmount()
         {
-            // Nowy dzień => reset bazy equity i odblokowanie handlu.
+            return InitialBalance * DailyLossLimitPercent / 100.0;
+        }
+
+        // Equity, poniżej którego bot zamyka wszystko na stałe (np. 10 000 * (1 - 9%) = 9 100).
+        private double TotalLossFloor()
+        {
+            double effectivePercent = Math.Max(0.0, MaxTotalLossPercent - TotalLossBufferPercent);
+            return InitialBalance * (1.0 - effectivePercent / 100.0);
+        }
+
+        // Equity, poniżej którego bot zamyka wszystko do końca dnia.
+        private double DailyLossFloor()
+        {
+            return _dayStartBalance - DailyLossLimitAmount();
+        }
+
+        // Nowy dzień (północ CE(S)T): saldo z początku dnia odtwarzamy z historii,
+        // żeby restart bota w trakcie dnia nie kasował dziennych strat.
+        private void StartNewDay(DateTime day)
+        {
+            _currentDay = day;
+            _tradingBlockedToday = false;
+
+            double closedTodayNet = 0;
+            foreach (var t in History)
+                if (t.ClosingTime >= day)
+                    closedTodayNet += t.NetProfit;
+
+            _dayStartBalance = Account.Balance - closedTodayNet;
+
+            Print("Dzień handlowy {0:yyyy-MM-dd}. Saldo startowe: {1:F2}, dzienny próg equity: {2:F2}",
+                day, _dayStartBalance, DailyLossFloor());
+        }
+
+        // Sprawdzenie limitów – wywoływane na każdym ticku i barze.
+        private void CheckRiskLimits()
+        {
+            if (_totalLimitHit)
+                return;
+
             if (Server.Time.Date != _currentDay)
+                StartNewDay(Server.Time.Date);
+
+            double equity = Account.Equity;
+
+            // Limit całkowity – zamykamy wszystko i zatrzymujemy bota na stałe.
+            if (equity <= TotalLossFloor())
             {
-                _currentDay = Server.Time.Date;
-                _dayStartEquity = Account.Equity;
-                _tradingBlockedToday = false;
-                Print("Nowy dzień handlowy. Equity startowe: {0:F2}", _dayStartEquity);
+                _totalLimitHit = true;
+                Print("STOP CAŁKOWITY: equity {0:F2} <= {1:F2} (limit {2:F2}% - bufor {3:F2}%). Zamykam wszystko i zatrzymuję bota.",
+                    equity, TotalLossFloor(), MaxTotalLossPercent, TotalLossBufferPercent);
+                CloseAllBotExposure();
+                Stop();
+                return;
             }
 
-            // Wyliczenie bieżącego dziennego drawdownu jako % spadku equity względem początku dnia.
-            if (_dayStartEquity > 0)
+            // Limit dzienny – zamykamy wszystko i blokujemy do następnego dnia.
+            if (!_tradingBlockedToday && equity <= DailyLossFloor())
             {
-                double ddPercent = (_dayStartEquity - Account.Equity) / _dayStartEquity * 100.0;
-                if (ddPercent >= MaxDailyDrawdownPercent && !_tradingBlockedToday)
-                {
-                    _tradingBlockedToday = true;
-                    Print("STOP: przekroczono dzienny limit drawdownu ({0:F2}% >= {1:F2}%). Handel wstrzymany do jutra.",
-                        ddPercent, MaxDailyDrawdownPercent);
-                }
+                _tradingBlockedToday = true;
+                Print("STOP DZIENNY: equity {0:F2} <= {1:F2} (saldo startowe {2:F2} - {3:F2}%). Zamykam pozycje, handel wstrzymany do jutra.",
+                    equity, DailyLossFloor(), _dayStartBalance, DailyLossLimitPercent);
+                CloseAllBotExposure();
             }
+        }
+
+        // Czy transakcja z danym ryzykiem (kwota do SL) zmieści się w limitach.
+        private bool RiskFitsLimits(double riskAmount)
+        {
+            double equityAtSl = Account.Equity - riskAmount;
+
+            if (equityAtSl <= DailyLossFloor())
+            {
+                Print("Odrzucono: SL ({0:F2}) przebiłby limit dzienny (equity przy SL {1:F2} <= {2:F2}).",
+                    riskAmount, equityAtSl, DailyLossFloor());
+                return false;
+            }
+            if (equityAtSl <= TotalLossFloor())
+            {
+                Print("Odrzucono: SL ({0:F2}) przebiłby limit całkowity (equity przy SL {1:F2} <= {2:F2}).",
+                    riskAmount, equityAtSl, TotalLossFloor());
+                return false;
+            }
+            return true;
+        }
+
+        // Zamknięcie wszystkich pozycji i usunięcie zleceń oczekujących bota (wszystkie pary).
+        private void CloseAllBotExposure()
+        {
+            foreach (var o in new List<PendingOrder>(PendingOrders))
+                if (o.Label == BotLabel)
+                    CancelPendingOrder(o);
+
+            foreach (var p in new List<Position>(Positions))
+                if (p.Label == BotLabel)
+                    ClosePosition(p);
+        }
+
+        // ----------------------------------------------------------------------
+        //  INSTRUMENTY I RYZYKO
+        // ----------------------------------------------------------------------
+
+        private bool IsGold()
+        {
+            return SymbolName.ToUpperInvariant().Contains("XAUUSD");
+        }
+
+        private bool IsAllowedSymbol()
+        {
+            string s = SymbolName.ToUpperInvariant();
+            if (s.Contains("EURUSD") || s.Contains("GBPUSD"))
+                return true;
+            return AllowGold && IsGold();
+        }
+
+        // Ryzyko na transakcję z uwzględnieniem limitu dla złota.
+        private double EffectiveRiskPercent()
+        {
+            return IsGold() ? Math.Min(RiskPercent, GoldMaxRiskPercent) : RiskPercent;
         }
 
         // ----------------------------------------------------------------------
@@ -268,7 +434,7 @@ namespace cAlgo.Robots
         }
 
         // ----------------------------------------------------------------------
-        //  WYKONANIE ZLECEŃ + OBLICZANIE WOLUMENU (auto-compounding)
+        //  WYKONANIE ZLECEŃ + OBLICZANIE WOLUMENU
         // ----------------------------------------------------------------------
 
         // Otwarcie pozycji rynkowej z dynamicznym wolumenem, SL i TP.
@@ -287,7 +453,6 @@ namespace cAlgo.Robots
 
             double tpPips = slPips * RiskReward;
 
-            // Wolumen liczony od AKTUALNEGO salda => automatyczne składanie kapitału.
             double volume = CalculatePositionVolume(slPips);
             if (volume <= 0)
                 return; // powód wypisany w CalculatePositionVolume
@@ -326,11 +491,11 @@ namespace cAlgo.Robots
                 Print("Błąd złożenia zlecenia stop: {0}", result.Error);
         }
 
-        // Obliczenie wolumenu w jednostkach na podstawie ryzyka i odległości SL.
+        // Obliczenie wolumenu w jednostkach na podstawie stałego ryzyka i odległości SL.
         private double CalculatePositionVolume(double slPips)
         {
-            // Kwota ryzyka = procent AKTUALNEGO salda (auto-compounding).
-            double riskAmount = Account.Balance * RiskPercent / 100.0;
+            // Kwota ryzyka = stały % AKTUALNEGO salda (dla złota max 0,25%).
+            double riskAmount = Account.Balance * EffectiveRiskPercent() / 100.0;
 
             // Wartość jednego pipsa dla 1 jednostki wolumenu (w walucie konta).
             double pipValuePerUnit = Symbol.PipValue;
@@ -343,7 +508,7 @@ namespace cAlgo.Robots
             // Surowy wolumen = ryzyko / (odległość SL w pipsach * wartość pipsa na jednostkę).
             double rawVolume = riskAmount / (slPips * pipValuePerUnit);
 
-            // Normalizacja do dozwolonego kroku wolumenu (zaokrąglenie w dół).
+            // Normalizacja do dozwolonego kroku wolumenu (zaokrąglenie w dół – ryzyko nigdy nie rośnie).
             double volume = Symbol.NormalizeVolumeInUnits(rawVolume, RoundingMode.Down);
 
             // Zabezpieczenie: za mały kapitał na minimalny wolumen.
@@ -358,17 +523,22 @@ namespace cAlgo.Robots
             if (volume > Symbol.VolumeInUnitsMax)
                 volume = Symbol.VolumeInUnitsMax;
 
+            // Faktyczne ryzyko po zaokrągleniu – musi zmieścić się w limitach FTMO.
+            double actualRisk = volume * slPips * pipValuePerUnit;
+            if (!RiskFitsLimits(actualRisk))
+                return 0;
+
             return volume;
         }
 
         // ----------------------------------------------------------------------
-        //  POMOCNICZE – liczenie pozycji i zleceń bota
+        //  POMOCNICZE – liczenie pozycji, zleceń i transakcji bota (wszystkie pary)
         // ----------------------------------------------------------------------
         private int CountBotPositions()
         {
             int count = 0;
             foreach (var p in Positions)
-                if (p.Label == BotLabel && p.SymbolName == SymbolName)
+                if (p.Label == BotLabel)
                     count++;
             return count;
         }
@@ -377,9 +547,22 @@ namespace cAlgo.Robots
         {
             int count = 0;
             foreach (var o in PendingOrders)
-                if (o.Label == BotLabel && o.SymbolName == SymbolName)
+                if (o.Label == BotLabel)
                     count++;
             return count;
+        }
+
+        // Liczba transakcji otwartych dzisiaj (zamknięte z historii + nadal otwarte).
+        private int CountTradesToday()
+        {
+            var ids = new HashSet<int>();
+            foreach (var t in History)
+                if (t.Label == BotLabel && t.EntryTime >= _currentDay)
+                    ids.Add(t.PositionId);
+            foreach (var p in Positions)
+                if (p.Label == BotLabel && p.EntryTime >= _currentDay)
+                    ids.Add(p.Id);
+            return ids.Count;
         }
 
         // ----------------------------------------------------------------------
